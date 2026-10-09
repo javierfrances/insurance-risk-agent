@@ -13,7 +13,7 @@ from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
 from a2a.server.tasks import InMemoryTaskStore
 from a2a.types import AgentCard, AgentCapabilities, AgentInterface, AgentSkill
-from a2a.utils import new_agent_text_message
+from a2a.helpers import new_text_message
 
 from telemetry import configure
 configure()
@@ -36,7 +36,7 @@ class RiskExecutor(AgentExecutor):
             except Exception:
                 logging.exception('Agent invocation failed')
                 answer = 'Error procesando la solicitud ficticia. Revisa configuración y logs.'
-            await event_queue.enqueue_event(new_agent_text_message(answer))
+            await event_queue.enqueue_event(new_text_message(answer))
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         raise NotImplementedError('Cancellation not supported by this demo')
