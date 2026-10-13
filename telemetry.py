@@ -1,20 +1,21 @@
 
 """
-OpenTelemetry integration for watsonx Orchestrate.
-
-External LangGraph agent running on IBM Code Engine.
-Exports OTLP traces using renewable IBM Cloud IAM tokens.
+OpenTelemetry exporter for watsonx Orchestrate.
+Includes IAM token renewal and HTTP error diagnostics.
 """
 
 import atexit
 import json
 import logging
 import os
+import re
 import threading
 import time
 
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+import requests
 
 from opentelemetry import trace
 from opentelemetry.sdk.resources import Resource
@@ -29,54 +30,93 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
     OTLPSpanExporter,
 )
 
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("insurance-risk-telemetry")
 
 
 # -----------------------------------------
-# Environment configuration
+# Configuration
 # -----------------------------------------
 
 WXO_AGENT_ID = os.getenv("WXO_AGENT_ID", "")
 WXO_TENANT_ID = os.getenv("WXO_TENANT_ID", "")
-WXO_AGENT_NAME = os.getenv(
-    "WXO_AGENT_NAME",
-    "insurance-risk-preassessment"
-)
-
 WXO_API_KEY = os.getenv("WXO_API_KEY", "")
-
-TOKEN_URL = os.getenv(
-    "TOKEN_URL",
-    "https://iam.cloud.ibm.com/identity/token"
-)
 
 OTEL_EXPORT_URL = os.getenv("OTEL_EXPORT_URL", "")
 
+TOKEN_URL = os.getenv(
+    "TOKEN_URL",
+    "https://iam.cloud.ibm.com/identity/token",
+)
+
 ENVIRONMENT_NAME = os.getenv(
-    "ENVIRONMENT_NAME",
-    "draft"
+    "ENVIRONMENT_NAME", "draft"
 )
 
 
 # -----------------------------------------
-# IBM Cloud IAM Authentication
+# Safe HTTP diagnostics
+# -----------------------------------------
+
+class DiagnosticSession(requests.Session):
+    """
+    Log the HTTP status and a sanitized error response.
+    Never log Authorization headers or request payloads.
+    """
+
+    def post(self, url, *args, **kwargs):
+        response = super().post(url, *args, **kwargs)
+
+        if response.status_code >= 400:
+            body = response.text[:1500]
+
+            # Mask known credentials if echoed in errors.
+            for secret in (
+                WXO_API_KEY,
+                getattr(self, "iam_token", ""),
+            ):
+                if secret:
+                    body = body.replace(secret, "[REDACTED]")
+
+            body = re.sub(
+                r"(?i)Bearer\s+[A-Za-z0-9._~+/-]+",
+                "Bearer [REDACTED]",
+                body,
+            )
+
+            body = re.sub(
+                r'(?i)(["\'](?:access_token|'
+                r'api_key|apikey|authorization)["\']'
+                r'\s*:\s*["\'])[^"\']+',
+                r'\1[REDACTED]',
+                body,
+            )
+
+            logger.error(
+                "WXO OTLP ingestion rejected request. "
+                "HTTP status=%s; response=%s",
+                response.status_code,
+                body or "<empty response>",
+            )
+
+        elif response.status_code < 300:
+            logger.info(
+                "WXO OTLP HTTP accepted: status=%s",
+                response.status_code,
+            )
+
+        return response
+
+
+# -----------------------------------------
+# IBM Cloud IAM
 # -----------------------------------------
 
 def get_iam_token():
-    """
-    Exchange an IBM Cloud API Key for an IAM access token.
-
-    Returns:
-        token: IAM Bearer token
-        expires_at: expiration timestamp
-    """
 
     payload = urlencode({
-        "grant_type": (
-            "urn:ibm:params:oauth:grant-type:apikey"
-        ),
+        "grant_type":
+            "urn:ibm:params:oauth:grant-type:apikey",
         "apikey": WXO_API_KEY,
     }).encode("utf-8")
 
@@ -86,9 +126,8 @@ def get_iam_token():
         method="POST",
         headers={
             "Accept": "application/json",
-            "Content-Type": (
-                "application/x-www-form-urlencoded"
-            ),
+            "Content-Type":
+                "application/x-www-form-urlencoded",
         },
     )
 
@@ -109,31 +148,25 @@ def get_iam_token():
             "expiration",
             time.time() + float(
                 data.get("expires_in", 3000)
-            )
+            ),
         )
     )
 
-    logger.info(
-        "IBM Cloud IAM token obtained successfully"
-    )
+    logger.info("IAM token obtained successfully")
 
     return token, expires_at
 
 
 # -----------------------------------------
-# Refreshing OTLP Exporter
+# Auto-refreshing OTLP exporter
 # -----------------------------------------
 
 class RefreshingOTLPSpanExporter(SpanExporter):
-    """
-    Automatically refreshes IAM tokens when required.
-    """
 
     def __init__(self, endpoint, tenant_id, agent_id):
         self.endpoint = endpoint
         self.tenant_id = tenant_id
         self.agent_id = agent_id
-
         self.lock = threading.Lock()
         self.delegate = None
         self.expires_at = 0
@@ -144,12 +177,8 @@ class RefreshingOTLPSpanExporter(SpanExporter):
         with self.lock:
 
             if self.closed:
-                raise RuntimeError(
-                    "OTLP exporter is shut down"
-                )
+                raise RuntimeError("Exporter shut down")
 
-            # Reuse the current token until 2 minutes
-            # before its expiration.
             if (
                 self.delegate is not None
                 and time.time() < self.expires_at - 120
@@ -158,7 +187,10 @@ class RefreshingOTLPSpanExporter(SpanExporter):
 
             token, expires_at = get_iam_token()
 
-            exporter = OTLPSpanExporter(
+            session = DiagnosticSession()
+            session.iam_token = token
+
+            new_exporter = OTLPSpanExporter(
                 endpoint=self.endpoint,
                 headers={
                     "Authorization": f"Bearer {token}",
@@ -166,19 +198,19 @@ class RefreshingOTLPSpanExporter(SpanExporter):
                     "x-ibm-agent-id": self.agent_id,
                     "x-langfuse-ingestion-version": "4",
                 },
+                session=session,
                 timeout=15,
             )
 
             old_exporter = self.delegate
-
-            self.delegate = exporter
+            self.delegate = new_exporter
             self.expires_at = expires_at
 
-            if old_exporter is not None:
+            if old_exporter:
                 old_exporter.shutdown()
 
             logger.info(
-                "watsonx Orchestrate OTLP exporter refreshed"
+                "WXO OTLP exporter initialized/refreshed"
             )
 
             return self.delegate
@@ -191,7 +223,7 @@ class RefreshingOTLPSpanExporter(SpanExporter):
 
         except Exception:
             logger.exception(
-                "Failed to export traces to watsonx Orchestrate"
+                "Failed to export traces to wxO"
             )
             return SpanExportResult.FAILURE
 
@@ -205,17 +237,18 @@ class RefreshingOTLPSpanExporter(SpanExporter):
         return exporter.force_flush(timeout_millis)
 
     def shutdown(self):
+
         with self.lock:
             self.closed = True
             exporter = self.delegate
             self.delegate = None
 
-        if exporter is not None:
+        if exporter:
             exporter.shutdown()
 
 
 # -----------------------------------------
-# Configure OpenTelemetry
+# OpenTelemetry initialization
 # -----------------------------------------
 
 def configure():
@@ -224,42 +257,39 @@ def configure():
         "service.name": "insurance-risk-demo",
         "service.version": "1.0.0",
         "agent.id": WXO_AGENT_ID,
-        "agent.name": WXO_AGENT_NAME,
         "tenant.id": WXO_TENANT_ID,
         "environment.name": ENVIRONMENT_NAME,
-        "deployment.environment.name": ENVIRONMENT_NAME,
+        "deployment.environment": ENVIRONMENT_NAME,
     })
 
     provider = TracerProvider(resource=resource)
 
-    # Optional local tracing for debugging.
-    if os.getenv("OTEL_CONSOLE_ENABLED", "false").lower() == "true":
+    # Optional console debugging.
+    if os.getenv(
+        "OTEL_CONSOLE_ENABLED", "false"
+    ).lower() == "true":
+
         provider.add_span_processor(
-            BatchSpanProcessor(
-                ConsoleSpanExporter()
-            )
+            BatchSpanProcessor(ConsoleSpanExporter())
         )
 
-    # Enable watsonx Orchestrate ingestion
-    # only when all required settings exist.
-    required_values = {
-        "OTEL_EXPORT_URL": OTEL_EXPORT_URL,
-        "WXO_API_KEY": WXO_API_KEY,
+    required = {
         "WXO_AGENT_ID": WXO_AGENT_ID,
         "WXO_TENANT_ID": WXO_TENANT_ID,
+        "WXO_API_KEY": WXO_API_KEY,
+        "OTEL_EXPORT_URL": OTEL_EXPORT_URL,
     }
 
     missing = [
-        key for key, value in required_values.items()
+        key for key, value in required.items()
         if not value
     ]
 
     if missing:
         logger.warning(
-            "wxO telemetry disabled. Missing: %s",
-            ", ".join(missing)
+            "WXO telemetry disabled. Missing: %s",
+            ", ".join(missing),
         )
-
     else:
         exporter = RefreshingOTLPSpanExporter(
             endpoint=OTEL_EXPORT_URL,
@@ -271,17 +301,10 @@ def configure():
             BatchSpanProcessor(exporter)
         )
 
-        logger.info(
-            "watsonx Orchestrate telemetry enabled"
-        )
-
-        logger.info(
-            "External Agent ID: %s",
-            WXO_AGENT_ID
-        )
+        logger.info("WXO telemetry exporter enabled")
+        logger.info("WXO Agent ID: %s", WXO_AGENT_ID)
 
     trace.set_tracer_provider(provider)
-
     atexit.register(provider.shutdown)
 
     return provider
