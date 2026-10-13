@@ -1,14 +1,19 @@
 
 """
-OpenTelemetry exporter for watsonx Orchestrate.
-Includes IAM token renewal and HTTP error diagnostics.
+OpenTelemetry integration for IBM watsonx Orchestrate.
+
+Features:
+- IBM Cloud IAM authentication
+- Automatic bearer token renewal
+- OTLP/HTTP trace export
+- Safe HTTP status diagnostics
+- Export success/failure logging
 """
 
 import atexit
 import json
 import logging
 import os
-import re
 import threading
 import time
 
@@ -30,13 +35,19 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
     OTLPSpanExporter,
 )
 
+
+# --------------------------------------------------
+# Logging
+# --------------------------------------------------
+
 logging.basicConfig(level=logging.INFO)
+
 logger = logging.getLogger("insurance-risk-telemetry")
 
 
-# -----------------------------------------
-# Configuration
-# -----------------------------------------
+# --------------------------------------------------
+# Environment configuration
+# --------------------------------------------------
 
 WXO_AGENT_ID = os.getenv("WXO_AGENT_ID", "")
 WXO_TENANT_ID = os.getenv("WXO_TENANT_ID", "")
@@ -54,63 +65,70 @@ ENVIRONMENT_NAME = os.getenv(
 )
 
 
-# -----------------------------------------
-# Safe HTTP diagnostics
-# -----------------------------------------
+# --------------------------------------------------
+# Diagnostic HTTP session
+# --------------------------------------------------
 
 class DiagnosticSession(requests.Session):
     """
-    Log the HTTP status and a sanitized error response.
-    Never log Authorization headers or request payloads.
+    Intercepts requests at the transport layer.
+
+    Logs:
+    - HTTP status code
+    - Response body length
+    - OTLP endpoint status
+
+    Does not log:
+    - Authorization headers
+    - API keys
+    - Bearer tokens
+    - Request payloads
     """
 
-    def post(self, url, *args, **kwargs):
-        response = super().post(url, *args, **kwargs)
+    def send(self, request, **kwargs):
 
-        if response.status_code >= 400:
-            body = response.text[:1500]
+        logger.info(
+            "WXO OTLP HTTP request starting"
+        )
 
-            # Mask known credentials if echoed in errors.
-            for secret in (
-                WXO_API_KEY,
-                getattr(self, "iam_token", ""),
-            ):
-                if secret:
-                    body = body.replace(secret, "[REDACTED]")
-
-            body = re.sub(
-                r"(?i)Bearer\s+[A-Za-z0-9._~+/-]+",
-                "Bearer [REDACTED]",
-                body,
+        try:
+            response = super().send(
+                request, **kwargs
             )
 
-            body = re.sub(
-                r'(?i)(["\'](?:access_token|'
-                r'api_key|apikey|authorization)["\']'
-                r'\s*:\s*["\'])[^"\']+',
-                r'\1[REDACTED]',
-                body,
+            logger.info(
+                "WXO OTLP HTTP response: status=%s",
+                response.status_code,
             )
+
+            if response.status_code >= 400:
+                logger.error(
+                    "WXO OTLP HTTP error: "
+                    "status=%s, body_length=%s",
+                    response.status_code,
+                    len(response.content),
+                )
+
+            elif 200 <= response.status_code < 300:
+                logger.info(
+                    "WXO OTLP ingestion HTTP accepted"
+                )
+
+            return response
+
+        except requests.RequestException as exc:
 
             logger.error(
-                "WXO OTLP ingestion rejected request. "
-                "HTTP status=%s; response=%s",
-                response.status_code,
-                body or "<empty response>",
+                "WXO OTLP transport failure: %s",
+                type(exc).__name__,
             )
 
-        elif response.status_code < 300:
-            logger.info(
-                "WXO OTLP HTTP accepted: status=%s",
-                response.status_code,
-            )
-
-        return response
+            raise
 
 
-# -----------------------------------------
-# IBM Cloud IAM
-# -----------------------------------------
+# --------------------------------------------------
+# IBM Cloud IAM token exchange
+# --------------------------------------------------
 
 def get_iam_token():
 
@@ -131,16 +149,22 @@ def get_iam_token():
         },
     )
 
-    with urlopen(request, timeout=30) as response:
+    with urlopen(
+        request, timeout=30
+    ) as response:
+
         data = json.loads(
             response.read().decode("utf-8")
         )
 
-    token = data.get("access_token") or data.get("token")
+    token = (
+        data.get("access_token")
+        or data.get("token")
+    )
 
     if not token:
         raise RuntimeError(
-            "IAM did not return an access token"
+            "IBM IAM did not return an access token"
         )
 
     expires_at = float(
@@ -152,22 +176,32 @@ def get_iam_token():
         )
     )
 
-    logger.info("IAM token obtained successfully")
+    logger.info(
+        "IAM token obtained successfully"
+    )
 
     return token, expires_at
 
 
-# -----------------------------------------
-# Auto-refreshing OTLP exporter
-# -----------------------------------------
+# --------------------------------------------------
+# Refreshing OTLP exporter
+# --------------------------------------------------
 
 class RefreshingOTLPSpanExporter(SpanExporter):
 
-    def __init__(self, endpoint, tenant_id, agent_id):
+    def __init__(
+        self,
+        endpoint,
+        tenant_id,
+        agent_id,
+    ):
+
         self.endpoint = endpoint
         self.tenant_id = tenant_id
         self.agent_id = agent_id
+
         self.lock = threading.Lock()
+
         self.delegate = None
         self.expires_at = 0
         self.closed = False
@@ -177,32 +211,39 @@ class RefreshingOTLPSpanExporter(SpanExporter):
         with self.lock:
 
             if self.closed:
-                raise RuntimeError("Exporter shut down")
+                raise RuntimeError(
+                    "Exporter already shut down"
+                )
 
             if (
                 self.delegate is not None
-                and time.time() < self.expires_at - 120
+                and time.time()
+                < self.expires_at - 120
             ):
                 return self.delegate
 
             token, expires_at = get_iam_token()
 
             session = DiagnosticSession()
-            session.iam_token = token
 
             new_exporter = OTLPSpanExporter(
                 endpoint=self.endpoint,
                 headers={
-                    "Authorization": f"Bearer {token}",
-                    "x-ibm-tenant-id": self.tenant_id,
-                    "x-ibm-agent-id": self.agent_id,
-                    "x-langfuse-ingestion-version": "4",
+                    "Authorization":
+                        f"Bearer {token}",
+                    "x-ibm-tenant-id":
+                        self.tenant_id,
+                    "x-ibm-agent-id":
+                        self.agent_id,
+                    "x-langfuse-ingestion-version":
+                        "4",
                 },
                 session=session,
                 timeout=15,
             )
 
             old_exporter = self.delegate
+
             self.delegate = new_exporter
             self.expires_at = expires_at
 
@@ -210,36 +251,58 @@ class RefreshingOTLPSpanExporter(SpanExporter):
                 old_exporter.shutdown()
 
             logger.info(
-                "WXO OTLP exporter initialized/refreshed"
+                "WXO OTLP exporter "
+                "initialized/refreshed"
             )
 
             return self.delegate
 
     def export(self, spans):
 
+        logger.info(
+            "WXO OTLP export started: spans=%s",
+            len(spans),
+        )
+
         try:
+
             exporter = self._get_exporter()
-            return exporter.export(spans)
+
+            result = exporter.export(spans)
+
+            if result == SpanExportResult.SUCCESS:
+                logger.info(
+                    "WXO OTLP export result: SUCCESS"
+                )
+
+            else:
+                logger.error(
+                    "WXO OTLP export result: FAILURE"
+                )
+
+            return result
 
         except Exception:
+
             logger.exception(
                 "Failed to export traces to wxO"
             )
+
             return SpanExportResult.FAILURE
 
     def force_flush(self, timeout_millis=30000):
-        with self.lock:
-            exporter = self.delegate
 
-        if exporter is None:
-            return True
-
-        return exporter.force_flush(timeout_millis)
+        # OTLP/HTTP exports synchronously when
+        # its export() method is invoked.
+        # BatchSpanProcessor handles its own queue.
+        return True
 
     def shutdown(self):
 
         with self.lock:
+
             self.closed = True
+
             exporter = self.delegate
             self.delegate = None
 
@@ -247,9 +310,9 @@ class RefreshingOTLPSpanExporter(SpanExporter):
             exporter.shutdown()
 
 
-# -----------------------------------------
-# OpenTelemetry initialization
-# -----------------------------------------
+# --------------------------------------------------
+# Configure OpenTelemetry
+# --------------------------------------------------
 
 def configure():
 
@@ -259,18 +322,23 @@ def configure():
         "agent.id": WXO_AGENT_ID,
         "tenant.id": WXO_TENANT_ID,
         "environment.name": ENVIRONMENT_NAME,
-        "deployment.environment": ENVIRONMENT_NAME,
+        "deployment.environment.name":
+            ENVIRONMENT_NAME,
     })
 
-    provider = TracerProvider(resource=resource)
+    provider = TracerProvider(
+        resource=resource
+    )
 
-    # Optional console debugging.
+    # Optional local debugging
     if os.getenv(
         "OTEL_CONSOLE_ENABLED", "false"
     ).lower() == "true":
 
         provider.add_span_processor(
-            BatchSpanProcessor(ConsoleSpanExporter())
+            BatchSpanProcessor(
+                ConsoleSpanExporter()
+            )
         )
 
     required = {
@@ -281,16 +349,20 @@ def configure():
     }
 
     missing = [
-        key for key, value in required.items()
+        name
+        for name, value in required.items()
         if not value
     ]
 
     if missing:
+
         logger.warning(
             "WXO telemetry disabled. Missing: %s",
             ", ".join(missing),
         )
+
     else:
+
         exporter = RefreshingOTLPSpanExporter(
             endpoint=OTEL_EXPORT_URL,
             tenant_id=WXO_TENANT_ID,
@@ -298,13 +370,24 @@ def configure():
         )
 
         provider.add_span_processor(
-            BatchSpanProcessor(exporter)
+            BatchSpanProcessor(
+                exporter
+            )
         )
 
-        logger.info("WXO telemetry exporter enabled")
-        logger.info("WXO Agent ID: %s", WXO_AGENT_ID)
+        logger.info(
+            "WXO telemetry exporter enabled"
+        )
+
+        logger.info(
+            "WXO Agent ID: %s",
+            WXO_AGENT_ID,
+        )
 
     trace.set_tracer_provider(provider)
-    atexit.register(provider.shutdown)
+
+    atexit.register(
+        provider.shutdown
+    )
 
     return provider
