@@ -1,9 +1,13 @@
 
 import os
-import uuid
+import secrets
 import logging
+import asyncio
+import contextvars
 import uvicorn
+
 from starlette.applications import Starlette
+from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 from opentelemetry import trace
@@ -25,12 +29,23 @@ from a2a.types import (
 from a2a.helpers import new_text_message
 
 from telemetry import configure
+
 configure()
 
 from agent import ask
 
 logging.basicConfig(level=logging.INFO)
+
 tracer = trace.get_tracer("insurance-risk-a2a-server")
+
+
+# -----------------------------------------
+# A2A API Key configuration
+# -----------------------------------------
+
+A2A_API_KEY = os.environ["A2A_API_KEY"]
+
+API_KEY_HEADER = "X-Agent-API-Key"
 
 
 # -----------------------------------------
@@ -44,9 +59,6 @@ class RiskExecutor(AgentExecutor):
         context: RequestContext,
         event_queue: EventQueue
     ) -> None:
-
-        import asyncio
-        import contextvars
 
         question = context.get_user_input()
 
@@ -67,7 +79,12 @@ class RiskExecutor(AgentExecutor):
                 )
 
             except Exception:
+
                 logging.exception("Agent invocation failed")
+
+                span.record_exception(
+                    Exception("Agent execution failed")
+                )
 
                 answer = (
                     "Error procesando la solicitud ficticia. "
@@ -94,6 +111,7 @@ class RiskExecutor(AgentExecutor):
 # -----------------------------------------
 
 async def health(request):
+
     return JSONResponse({
         "status": "ok",
         "app": "insurance-risk-demo"
@@ -112,7 +130,7 @@ url = os.environ.get(
 
 # -----------------------------------------
 # A2A Agent Card
-# Supports A2A 1.0 and 0.3
+# Supports A2A 1.0 and A2A 0.3
 # -----------------------------------------
 
 card = AgentCard(
@@ -191,11 +209,11 @@ handler = DefaultRequestHandler(
 
 
 # -----------------------------------------
-# A2A HTTP Server
-# Enable backward compatibility with 0.3
+# Starlette application
 # -----------------------------------------
 
 app = Starlette(
+
     routes=[
 
         Route(
@@ -213,6 +231,46 @@ app = Starlette(
 
     ]
 )
+
+
+# -----------------------------------------
+# API Key Authentication Middleware
+# -----------------------------------------
+
+@app.middleware("http")
+async def validate_a2a_api_key(
+    request: Request,
+    call_next
+):
+
+    # Protect the A2A JSON-RPC endpoint.
+    # Keep Agent Card and health public.
+
+    if request.method == "POST":
+
+        received_key = request.headers.get(
+            API_KEY_HEADER,
+            ""
+        )
+
+        if not received_key or not secrets.compare_digest(
+            received_key,
+            A2A_API_KEY
+        ):
+
+            logging.warning(
+                "Unauthorized A2A request"
+            )
+
+            return JSONResponse(
+                {
+                    "error": "Unauthorized",
+                    "message": "Invalid or missing API Key"
+                },
+                status_code=401
+            )
+
+    return await call_next(request)
 
 
 # -----------------------------------------
